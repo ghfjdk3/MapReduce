@@ -1,4 +1,4 @@
-"""Master 节点 (JobTracker) — 双 Slot 管理 + 提前触发 Reduce"""
+"""Master 节点 (JobTracker) — 双 Slot 管理 + 心跳 + 容错"""
 
 import os
 import uuid
@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 from .protocol import (
     MASTER_REGISTER, MASTER_SUBMIT_JOB, MASTER_MAP_DONE, MASTER_REDUCE_DONE,
     MASTER_JOB_STATUS, WORKER_EXECUTE_MAP, WORKER_EXECUTE_REDUCE,
-    WORKER_NOTIFY_MAP_READY,
+    WORKER_NOTIFY_MAP_READY, WORKER_PING,
     FIELD_JOB_ID, FIELD_WORKER_PORT, FIELD_WORKER_ID,
     FIELD_INPUT_PATH, FIELD_OUTPUT_PATH, FIELD_MAPPER_PKL, FIELD_REDUCER_PKL,
     FIELD_LINES, FIELD_REDUCE_RESULT, FIELD_PARTITION_ID,
@@ -19,10 +19,23 @@ from .protocol import (
     FIELD_SLOT_TYPE, FIELD_STATUS, FIELD_ERROR,
     STATUS_PENDING, STATUS_MAP_RUNNING, STATUS_SHUFFLING,
     STATUS_REDUCE_RUNNING, STATUS_COMPLETED, STATUS_FAILED,
-    OUTPUT_DELIMITER, OUTPUT_LINE_END,
-    SLOT_TYPE_MAP, SLOT_TYPE_REDUCE, MAP_PROGRESS_TRIGGER_RATIO,
+    SLOT_TYPE_MAP, SLOT_TYPE_REDUCE,
 )
-from .network import post_json, make_url
+from .config import (
+    MAP_PROGRESS_TRIGGER_RATIO, MAP_PHASE_TIMEOUT, REDUCE_PHASE_TIMEOUT,
+    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
+    OUTPUT_DELIMITER, OUTPUT_LINE_END,
+)
+from .network import post_json, get_json, make_url, NetworkError
+
+
+def _ping_slot(slot):
+    try:
+        url = make_url(slot["host"], slot["port"], WORKER_PING)
+        get_json(url, timeout=3)
+        return True
+    except Exception:
+        return False
 
 
 class Master:
@@ -32,11 +45,120 @@ class Master:
         self.reduce_slots: List[Dict[str, Any]] = []
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._last_seen: Dict[str, float] = {}
+        self._heartbeat_running = False
 
     def run(self):
+        self._start_heartbeat()
         app = self._create_app()
         print(f"[Master] 启动于 http://0.0.0.0:{self.port}")
-        app.run(host="0.0.0.0", port=self.port, threaded=True)
+        app.run(host="0.0.0.0", port=self.port, threaded=False)
+
+    def _start_heartbeat(self):
+        if self._heartbeat_running:
+            return
+        self._heartbeat_running = True
+
+        def heartbeat_loop():
+            while True:
+                time.sleep(HEARTBEAT_INTERVAL)
+                with self._lock:
+                    all_slots = list(self.map_slots) + list(self.reduce_slots)
+                for slot in all_slots:
+                    alive = _ping_slot(slot)
+                    with self._lock:
+                        if alive:
+                            self._last_seen[slot[FIELD_WORKER_ID]] = time.time()
+                # 检查超时
+                self._check_dead_slots()
+
+        threading.Thread(target=heartbeat_loop, daemon=True).start()
+
+    def _check_dead_slots(self):
+        now = time.time()
+        with self._lock:
+            dead_map = []
+            dead_reduce = []
+            for s in self.map_slots:
+                sid = s[FIELD_WORKER_ID]
+                last = self._last_seen.get(sid, now)
+                if now - last > HEARTBEAT_TIMEOUT:
+                    dead_map.append(s)
+            for s in self.reduce_slots:
+                sid = s[FIELD_WORKER_ID]
+                last = self._last_seen.get(sid, now)
+                if now - last > HEARTBEAT_TIMEOUT:
+                    dead_reduce.append(s)
+
+            for s in dead_map:
+                self.map_slots.remove(s)
+                print(f"[Master] Map Slot {s['host']}:{s['port']} 失联，已移除")
+            for s in dead_reduce:
+                self.reduce_slots.remove(s)
+                print(f"[Master] Reduce Slot {s['host']}:{s['port']} 失联，已移除")
+
+            # 容错：重新分配受影响作业的 map/reduce 任务
+            for job_id, job in list(self.jobs.items()):
+                if job[FIELD_STATUS] in (STATUS_COMPLETED, STATUS_FAILED):
+                    continue
+                if dead_map and job[FIELD_STATUS] in (STATUS_MAP_RUNNING, STATUS_PENDING):
+                    self._reassign_map(job_id, dead_map)
+                if dead_reduce and job.get("reduce_dispatched"):
+                    self._reassign_reduce(job_id, dead_reduce)
+
+    def _reassign_map(self, job_id: str, dead_slots: list):
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        dead_ids = {s[FIELD_WORKER_ID] for s in dead_slots}
+        pending_chunks = job.get("_pending_map_chunks", [])
+        if not pending_chunks:
+            return
+        live_map = [s for s in self.map_slots if s[FIELD_WORKER_ID] not in dead_ids]
+        if not live_map:
+            return
+        print(f"[Master] 作业 {job_id}: 重新分配 map 任务到 {len(live_map)} 个存活 slot")
+        mapper_pkl_b64 = job[FIELD_MAPPER_PKL]
+        reducer_pkl_b64 = job[FIELD_REDUCER_PKL]
+        num_reducers = len(self.reduce_slots) or 1
+        for i, chunk in enumerate(pending_chunks):
+            slot = live_map[i % len(live_map)]
+            threading.Thread(target=self._send_map_task, args=(
+                slot, job_id, mapper_pkl_b64, reducer_pkl_b64, chunk, num_reducers), daemon=True).start()
+        job["_pending_map_chunks"].clear()
+        job["_total_map_tasks"] = len(self.map_slots)
+
+    def _send_map_task(self, slot, job_id, mapper_pkl_b64, reducer_pkl_b64, chunk, num_reducers):
+        try:
+            url = make_url(slot["host"], slot["port"], WORKER_EXECUTE_MAP)
+            post_json(url, {
+                FIELD_JOB_ID: job_id,
+                FIELD_MAPPER_PKL: mapper_pkl_b64,
+                FIELD_LINES: chunk,
+                FIELD_NUM_REDUCERS: num_reducers,
+                FIELD_REDUCER_PKL: reducer_pkl_b64,
+            })
+        except Exception as e:
+            print(f"[Master] 重新分配 map 失败 {slot['host']}:{slot['port']}: {e}")
+
+    def _reassign_reduce(self, job_id: str, dead_slots: list):
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        dead_ids = {s[FIELD_WORKER_ID] for s in dead_slots}
+        live_reduce = [s for s in self.reduce_slots if s[FIELD_WORKER_ID] not in dead_ids]
+        if not live_reduce:
+            return
+        total_map_tasks = job.get("_total_map_tasks", 0)
+        reducer_pkl_b64 = job[FIELD_REDUCER_PKL]
+        map_workers = [{"host": w["host"], "port": w["port"]} for w in self.map_slots]
+        print(f"[Master] 作业 {job_id}: 重新分配 reduce 任务到 {len(live_reduce)} 个存活 slot")
+        for i, slot in enumerate(live_reduce):
+            threading.Thread(target=self._send_reduce_init, args=(
+                slot, job_id, reducer_pkl_b64, i, total_map_tasks), daemon=True).start()
+            for mw in map_workers:
+                threading.Thread(target=self._send_notify, args=(
+                    slot, job_id, mw), daemon=True).start()
 
     def _create_app(self):
         from flask import Flask
@@ -80,17 +202,14 @@ class Master:
         }
 
         with self._lock:
-            if slot_type == SLOT_TYPE_MAP:
-                slots = self.map_slots
-            else:
-                slots = self.reduce_slots
-
+            slots = self.map_slots if slot_type == SLOT_TYPE_MAP else self.reduce_slots
             for w in slots:
                 if w["host"] == worker_info["host"] and w["port"] == worker_info["port"]:
                     worker_id = w[FIELD_WORKER_ID]
                     break
             else:
                 slots.append(worker_info)
+            self._last_seen[worker_id] = time.time()
 
         print(f"[Master] 注册: {slot_type} slot {worker_info['host']}:{worker_port} (id={worker_id})")
         return jsonify({FIELD_WORKER_ID: worker_id, "map_count": len(self.map_slots),
@@ -118,6 +237,7 @@ class Master:
             "reduce_results": [],
             "reduce_done_count": 0,
             "reduce_dispatched": False,
+            "_pending_map_chunks": [],
             FIELD_ERROR: None,
         }
         with self._lock:
@@ -148,7 +268,6 @@ class Master:
 
         print(f"[Master] map_done: job={job_id}, {count}/{total}")
 
-        # 检查是否已触发 reduce（10% 阈值）
         dispatched = False
         with self._lock:
             if not job.get("reduce_dispatched") and count / max(total, 1) >= MAP_PROGRESS_TRIGGER_RATIO:
@@ -158,7 +277,6 @@ class Master:
         if dispatched:
             self._dispatch_reduce_init(job_id, total)
 
-        # 通知所有 reduce slots：这个 map worker 的数据已就绪
         if worker_info:
             self._notify_all_reduce(job_id, worker_info)
 
@@ -212,25 +330,21 @@ class Master:
             num_reducers = len(reduce_slots)
             total_map_tasks = len(map_slots)
 
-            # 保存总数供 map_done 使用
             with self._lock:
                 self.jobs[job_id]["_total_map_tasks"] = total_map_tasks
 
-            # 1. 读取输入
             lines = self._read_input(input_path)
             if lines is None:
                 self._fail_job(job_id, f"无法读取: {input_path}")
                 return
             print(f"[Master] 作业 {job_id}: {len(lines)} 行, {total_map_tasks} map + {num_reducers} reduce slots")
 
-            # 2. Map 阶段
             self._set_status(job_id, STATUS_MAP_RUNNING)
             ok = self._dispatch_map(job_id, lines, map_slots, mapper_pkl_b64, reducer_pkl_b64, num_reducers)
             if not ok:
                 return
 
-            # 等待 map 全部完成
-            self._wait_for_count(job_id, "map_done_count", total_map_tasks, timeout=120)
+            self._wait_for_count(job_id, "map_done_count", total_map_tasks, timeout=MAP_PHASE_TIMEOUT)
             with self._lock:
                 j = self.jobs[job_id]
                 if j[FIELD_STATUS] == STATUS_FAILED:
@@ -241,20 +355,17 @@ class Master:
 
             print(f"[Master] 作业 {job_id}: Map 全部完成")
 
-            # 3. 如果没有提前触发，现在触发 reduce
             with self._lock:
                 j = self.jobs[job_id]
                 if not j.get("reduce_dispatched"):
                     j["reduce_dispatched"] = True
                     self._dispatch_reduce_init(job_id, total_map_tasks)
-                    # 通知所有 map workers 已就绪（可能已经提前通知过）
                     for mw in map_slots:
                         self._notify_all_reduce(job_id, {"host": mw["host"], "port": mw["port"]})
 
-            # 4. 等待 reduce 完成
             self._set_status(job_id, STATUS_SHUFFLING)
             self._set_status(job_id, STATUS_REDUCE_RUNNING)
-            self._wait_for_count(job_id, "reduce_done_count", num_reducers, timeout=120)
+            self._wait_for_count(job_id, "reduce_done_count", num_reducers, timeout=REDUCE_PHASE_TIMEOUT)
             with self._lock:
                 j = self.jobs[job_id]
                 if j[FIELD_STATUS] == STATUS_FAILED:
@@ -263,7 +374,6 @@ class Master:
                     self._fail_job(job_id, f"Reduce 超时: {j['reduce_done_count']}/{num_reducers}")
                     return
 
-            # 5. 输出
             print(f"[Master] 作业 {job_id}: Reduce 全部完成")
             with self._lock:
                 results = list(self.jobs[job_id]["reduce_results"])
@@ -288,6 +398,7 @@ class Master:
         chunks = self._split_list(lines, len(map_slots))
         with self._lock:
             self.jobs[job_id]["map_done_count"] = 0
+            self.jobs[job_id]["_pending_map_chunks"] = list(chunks)
 
         threads = []
         send_errors = []
@@ -323,7 +434,6 @@ class Master:
         return True
 
     def _dispatch_reduce_init(self, job_id: str, total_map_tasks: int):
-        """首次 dispatch reduce 任务（10% map 完成时触发）"""
         with self._lock:
             job = self.jobs[job_id]
             reducer_pkl_b64 = job[FIELD_REDUCER_PKL]
@@ -349,10 +459,8 @@ class Master:
             print(f"[Master] reduce init 失败 {slot['host']}:{slot['port']}: {e}")
 
     def _notify_all_reduce(self, job_id: str, map_worker_info: Dict):
-        """通知所有 reduce slots：一个 map worker 数据已就绪"""
         with self._lock:
             reduce_slots = list(self.reduce_slots)
-
         for slot in reduce_slots:
             threading.Thread(target=self._send_notify, args=(
                 slot, job_id, map_worker_info), daemon=True).start()

@@ -1,74 +1,67 @@
-"""
-网络通信工具模块
-封装 HTTP 请求/响应处理、重试逻辑
-"""
+"""网络通信工具 — HTTP 连接池"""
 
 import requests
-import json
+import threading
 from typing import Optional, Dict, Any
-from .protocol import DEFAULT_TIMEOUT
+from .config import HTTP_TIMEOUT
+
+_session_store = threading.local()
+
+
+def _get_session() -> requests.Session:
+    if not hasattr(_session_store, 'session'):
+        _session_store.session = requests.Session()
+    return _session_store.session
 
 
 def post_json(url: str, data: Optional[Dict[str, Any]] = None,
-              timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
-    """
-    发送 POST 请求，body 为 JSON 格式
-    返回解析后的 JSON 响应字典
-    """
+              timeout: int = HTTP_TIMEOUT) -> Dict[str, Any]:
+    ses = _get_session()
     try:
-        resp = requests.post(url, json=data, timeout=timeout)
+        resp = ses.post(url, json=data, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except requests.exceptions.ConnectionError:
-        raise NetworkError(f"无法连接到 {url}，请确认服务已启动")
+        raise NetworkError(f"无法连接到 {url}")
     except requests.exceptions.Timeout:
-        raise NetworkError(f"请求 {url} 超时（{timeout}秒）")
+        raise NetworkError(f"请求 {url} 超时")
     except requests.exceptions.HTTPError as e:
+        detail = ""
         try:
-            detail = e.response.json()
+            detail = e.response.json().get('error', '')
         except Exception:
-            detail = {}
-        raise NetworkError(
-            f"请求 {url} 失败: HTTP {e.response.status_code}"
-            + (f", {detail.get('error', '')}" if detail.get('error') else "")
-        )
+            pass
+        raise NetworkError(f"HTTP {e.response.status_code}" + (f": {detail}" if detail else ""))
     except requests.exceptions.RequestException as e:
-        raise NetworkError(f"请求 {url} 异常: {e}")
+        raise NetworkError(f"请求异常: {e}")
 
 
-def get_json(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
-    """
-    发送 GET 请求，返回解析后的 JSON 响应字典
-    """
+def get_json(url: str, timeout: int = HTTP_TIMEOUT) -> Dict[str, Any]:
+    ses = _get_session()
     try:
-        resp = requests.get(url, timeout=timeout)
+        resp = ses.get(url, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except requests.exceptions.ConnectionError:
-        raise NetworkError(f"无法连接到 {url}，请确认服务已启动")
+        raise NetworkError(f"无法连接到 {url}")
     except requests.exceptions.Timeout:
-        raise NetworkError(f"请求 {url} 超时（{timeout}秒）")
+        raise NetworkError(f"请求 {url} 超时")
     except requests.exceptions.HTTPError as e:
+        detail = ""
         try:
-            detail = e.response.json()
+            detail = e.response.json().get('error', '')
         except Exception:
-            detail = {}
-        raise NetworkError(
-            f"请求 {url} 失败: HTTP {e.response.status_code}"
-            + (f", {detail.get('error', '')}" if detail.get('error') else "")
-        )
+            pass
+        raise NetworkError(f"HTTP {e.response.status_code}" + (f": {detail}" if detail else ""))
     except requests.exceptions.RequestException as e:
-        raise NetworkError(f"请求 {url} 异常: {e}")
+        raise NetworkError(f"请求异常: {e}")
 
 
 def make_url(host: str, port: int, path: str) -> str:
-    """构造完整 URL"""
-    # 确保 path 以 / 开头
     if not path.startswith("/"):
         path = "/" + path
     return f"http://{host}:{port}{path}"
 
 
 class NetworkError(Exception):
-    """网络通信错误"""
     pass

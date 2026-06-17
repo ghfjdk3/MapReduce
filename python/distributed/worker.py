@@ -20,7 +20,11 @@ from .protocol import (
     FIELD_PARTITION_ID, FIELD_MAP_WORKER_INFO, FIELD_NUM_REDUCERS,
     FIELD_TOTAL_MAP_TASKS, FIELD_PARTITION_DATA,
     FIELD_SLOT_TYPE, FIELD_ERROR,
-    SLOT_TYPE_MAP, SLOT_TYPE_REDUCE, MAP_REDUCE_PORT_OFFSET,
+    SLOT_TYPE_MAP, SLOT_TYPE_REDUCE,
+)
+from .config import (
+    MAP_REDUCE_PORT_OFFSET, WORKER_REGISTER_RETRIES,
+    WORKER_REGISTER_RETRY_INTERVAL, NOTIFY_WAIT_TIMEOUT,
 )
 from .network import post_json, get_json, make_url
 
@@ -84,7 +88,7 @@ class MapSlot:
         return app
 
     def _register_loop(self):
-        for i in range(30):
+        for i in range(WORKER_REGISTER_RETRIES):
             try:
                 url = make_url(self.master_host, self.master_port, MASTER_REGISTER)
                 resp = post_json(url, {
@@ -95,8 +99,8 @@ class MapSlot:
                 print(f"[Map Slot :{self.port}] 注册成功, id={self.worker_id}")
                 return
             except Exception as e:
-                print(f"[Map Slot :{self.port}] 注册失败 ({i+1}/30): {e}")
-                time.sleep(1)
+                print(f"[Map Slot :{self.port}] 注册失败 ({i+1}/{WORKER_REGISTER_RETRIES}): {e}")
+                time.sleep(WORKER_REGISTER_RETRY_INTERVAL)
         sys.exit(1)
 
     def _handle_map(self, req):
@@ -201,7 +205,7 @@ class ReduceSlot:
         return app
 
     def _register_loop(self):
-        for i in range(30):
+        for i in range(WORKER_REGISTER_RETRIES):
             try:
                 url = make_url(self.master_host, self.master_port, MASTER_REGISTER)
                 resp = post_json(url, {
@@ -212,8 +216,8 @@ class ReduceSlot:
                 print(f"[Reduce Slot :{self.port}] 注册成功, id={self.worker_id}")
                 return
             except Exception as e:
-                print(f"[Reduce Slot :{self.port}] 注册失败 ({i+1}/30): {e}")
-                time.sleep(1)
+                print(f"[Reduce Slot :{self.port}] 注册失败 ({i+1}/{WORKER_REGISTER_RETRIES}): {e}")
+                time.sleep(WORKER_REGISTER_RETRY_INTERVAL)
         sys.exit(1)
 
     def _handle_execute_reduce(self, req):
@@ -241,14 +245,13 @@ class ReduceSlot:
         job_id = data.get(FIELD_JOB_ID, "")
         map_worker_info = data.get(FIELD_MAP_WORKER_INFO, {})
 
-        # 等待 execute_reduce 初始化完成（最多等 5 秒）
-        waited = 0
-        while waited < 50:
+        # 等待 execute_reduce 初始化完成
+        deadline = time.time() + NOTIFY_WAIT_TIMEOUT
+        while time.time() < deadline:
             with self._lock:
                 if job_id in self._ready_map_workers:
                     break
             time.sleep(0.1)
-            waited += 1
 
         should_final = False
         with self._lock:
