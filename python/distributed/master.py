@@ -225,7 +225,7 @@ class Master:
 
             # 2. Map 阶段
             self._set_status(job_id, STATUS_MAP_RUNNING)
-            ok = self._dispatch_map(job_id, lines, map_slots, mapper_pkl_b64, num_reducers)
+            ok = self._dispatch_map(job_id, lines, map_slots, mapper_pkl_b64, reducer_pkl_b64, num_reducers)
             if not ok:
                 return
 
@@ -284,7 +284,7 @@ class Master:
             return None
 
     def _dispatch_map(self, job_id: str, lines: List[str], map_slots: List[Dict],
-                      mapper_pkl_b64: str, num_reducers: int) -> bool:
+                      mapper_pkl_b64: str, reducer_pkl_b64: str, num_reducers: int) -> bool:
         chunks = self._split_list(lines, len(map_slots))
         with self._lock:
             self.jobs[job_id]["map_done_count"] = 0
@@ -300,6 +300,7 @@ class Master:
                     FIELD_MAPPER_PKL: mapper_pkl_b64,
                     FIELD_LINES: chunk,
                     FIELD_NUM_REDUCERS: num_reducers,
+                    FIELD_REDUCER_PKL: reducer_pkl_b64,
                 })
                 if not resp.get("ok"):
                     send_errors.append(f"Map {slot['host']}:{slot['port']} 失败: {resp.get(FIELD_ERROR)}")
@@ -331,10 +332,8 @@ class Master:
         print(f"[Master] 作业 {job_id}: 提前触发 reduce ({len(reduce_slots)} tasks)")
 
         for i, slot in enumerate(reduce_slots):
-            t = threading.Thread(target=self._send_reduce_init, args=(
-                slot, job_id, reducer_pkl_b64, i, total_map_tasks))
-            t.start()
-            t.join()
+            threading.Thread(target=self._send_reduce_init, args=(
+                slot, job_id, reducer_pkl_b64, i, total_map_tasks), daemon=True).start()
 
     def _send_reduce_init(self, slot: Dict, job_id: str, reducer_pkl_b64: str,
                           partition_id: int, total_map_tasks: int):
@@ -355,9 +354,8 @@ class Master:
             reduce_slots = list(self.reduce_slots)
 
         for slot in reduce_slots:
-            t = threading.Thread(target=self._send_notify, args=(slot, job_id, map_worker_info))
-            t.start()
-            t.join()
+            threading.Thread(target=self._send_notify, args=(
+                slot, job_id, map_worker_info), daemon=True).start()
 
     def _send_notify(self, slot: Dict, job_id: str, map_worker_info: Dict):
         try:

@@ -103,6 +103,7 @@ class MapSlot:
         data = req.get_json()
         job_id = data.get(FIELD_JOB_ID, "")
         mapper_pkl_b64 = data.get(FIELD_MAPPER_PKL, "")
+        reducer_pkl_b64 = data.get(FIELD_REDUCER_PKL, "")
         lines = data.get(FIELD_LINES, [])
         num_reducers = data.get(FIELD_NUM_REDUCERS, 1)
 
@@ -116,14 +117,30 @@ class MapSlot:
                     p = int(hashlib.md5(str(key).encode()).hexdigest(), 16) % num_reducers
                     partitions[p].append([key, value])
 
-            total = sum(len(v) for v in partitions.values())
-            print(f"[Map Slot :{self.port}] map 完成: {total} 对")
+            raw_total = sum(len(v) for v in partitions.values())
+
+            # Combine: 对每个 partition 本地归并相同 key
+            if reducer_pkl_b64:
+                reducer_cls = pickle.loads(base64.b64decode(reducer_pkl_b64))
+                reducer = reducer_cls()
+                for pid in range(num_reducers):
+                    if partitions[pid]:
+                        grouped: Dict[Any, List] = {}
+                        for key, value in partitions[pid]:
+                            grouped.setdefault(key, []).append(value)
+                        partitions[pid] = []
+                        for key, vals in grouped.items():
+                            r_key, r_value = reducer.reduce(key, vals)
+                            partitions[pid].append([r_key, r_value])
+
+            combined_total = sum(len(v) for v in partitions.values())
+            print(f"[Map Slot :{self.port}] map 完成: {raw_total} 对 → combine: {combined_total} 对")
 
             with self._lock:
                 self._partitions[job_id] = partitions
 
-            self._send_map_done(job_id, total)
-            return jsonify({"ok": True, "pair_count": total})
+            self._send_map_done(job_id, combined_total)
+            return jsonify({"ok": True, "pair_count": combined_total})
         except Exception as e:
             return jsonify({FIELD_ERROR: str(e), "ok": False}), 500
 
@@ -224,9 +241,16 @@ class ReduceSlot:
         job_id = data.get(FIELD_JOB_ID, "")
         map_worker_info = data.get(FIELD_MAP_WORKER_INFO, {})
 
-        if job_id in self._done:
-            return jsonify({"ok": True})
+        # 等待 execute_reduce 初始化完成（最多等 5 秒）
+        waited = 0
+        while waited < 50:
+            with self._lock:
+                if job_id in self._ready_map_workers:
+                    break
+            time.sleep(0.1)
+            waited += 1
 
+        should_final = False
         with self._lock:
             if job_id not in self._ready_map_workers:
                 return jsonify({"ok": True})
@@ -234,8 +258,12 @@ class ReduceSlot:
             if wid in self._ready_map_workers[job_id]:
                 return jsonify({"ok": True})
             self._ready_map_workers[job_id].add(wid)
+            total = self._total_map_tasks.get(job_id, 1)
+            if len(self._ready_map_workers[job_id]) >= total and job_id not in self._done:
+                self._done.add(job_id)
+                should_final = True
 
-        # 拉取该 map worker 的 partition 数据
+        # 拉取 partition 数据
         partition_id = self._partition_id.get(job_id, 0)
         try:
             url = make_url(map_worker_info["host"], map_worker_info["port"],
@@ -252,11 +280,8 @@ class ReduceSlot:
         print(f"[Reduce Slot :{self.port}] 拉取 map_worker={map_worker_info['host']}:{map_worker_info['port']}, "
               f"part={partition_id}, got={len(pd)}")
 
-        # 检查是否集齐所有 map worker
-        total = self._total_map_tasks.get(job_id, 1)
-        if len(self._ready_map_workers[job_id]) >= total:
-            self._done.add(job_id)
-            threading.Thread(target=self._do_final_reduce, args=(job_id,), daemon=True).start()
+        if should_final:
+            self._do_final_reduce(job_id)
 
         return jsonify({"ok": True})
 
