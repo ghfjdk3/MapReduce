@@ -12,6 +12,7 @@ MASTER_JOB_STATUS = "/job_status"
 # Worker API 路由
 WORKER_EXECUTE_MAP = "/execute_map"
 WORKER_EXECUTE_REDUCE = "/execute_reduce"
+WORKER_GET_PARTITION = "/partition"
 WORKER_PING = "/ping"
 
 # JSON 字段名
@@ -25,6 +26,10 @@ FIELD_LINES = "lines"
 FIELD_SHARD = "shard"
 FIELD_REDUCE_TASK = "reduce_task"
 FIELD_REDUCE_RESULT = "reduce_result"
+FIELD_PARTITION_ID = "partition_id"
+FIELD_MAP_WORKERS = "map_workers"
+FIELD_NUM_REDUCERS = "num_reducers"
+FIELD_PARTITION_DATA = "partition_data"
 FIELD_STATUS = "status"
 FIELD_ERROR = "error"
 FIELD_WORKER_ID = "worker_id"

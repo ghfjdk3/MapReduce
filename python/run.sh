@@ -14,8 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # 检查是否安装了 requests 和 flask
-python -c "import flask" 2>/dev/null || pip install flask
-python -c "import requests" 2>/dev/null || pip install requests
+python -c "import flask" 2>/dev/null || python -m pip install flask
+python -c "import requests" 2>/dev/null || python -m pip install requests
 
 echo "=========================================="
 echo " MapReduce 分布式 WordCount 运行脚本"
