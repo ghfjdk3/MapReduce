@@ -1,80 +1,14 @@
 """
-MapReduce 统一入口
+MapReduce 分布式框架统一入口
 用法:
-    # 单机版
-    python main.py standalone <input> <output> <mapper_pkl> <reducer_pkl>
-
-    # 分布式 - Master
     python main.py master [--port 5000]
-
-    # 分布式 - Worker
     python main.py worker --master localhost:5000 --port 5001
-
-    # 分布式 - Client
     python main.py client --master localhost:5000 --input ../input.txt --output ../output.txt
 """
 
 import argparse
 import os
 import sys
-
-
-def _cmd_standalone(args):
-    """单机版 MapReduce（原 main.py 逻辑）"""
-    import pickle
-    from typing import List, Tuple, Any, Dict
-
-    from mapper import Mapper
-    from reducer import Reducer
-
-    input_path = args.input
-    output_path = args.output
-    mapper_path = args.mapper_pkl
-    reducer_path = args.reducer_pkl
-
-    mapper: Mapper
-    with open(mapper_path, 'rb') as f:
-        mapper = pickle.load(f)()
-    reducer: Reducer
-    with open(reducer_path, 'rb') as f:
-        reducer = pickle.load(f)()
-
-    # input
-    lines = []
-    with open(input_path, 'r') as f:
-        for line in f:
-            lines.append(line[:-len(os.linesep)])
-
-    # map
-    pairs: List[Tuple[Any, Any]] = []
-    for line in lines:
-        pairs.extend(mapper.map(line))
-
-    # shuffle
-    intermediate: Dict[Any, list] = {}
-    for pair in pairs:
-        values = intermediate.get(pair[0])
-        if values is None:
-            intermediate[pair[0]] = [pair[1]]
-        else:
-            values.append(pair[1])
-    intermediate_list: List[Tuple[Any, list]] = list(intermediate.items())
-    intermediate_list.sort(key=lambda x: str(x[0]))
-
-    # reduce
-    result: List[Tuple[Any, Any]] = []
-    for pair in intermediate_list:
-        result.append(reducer.reduce(pair[0], pair[1]))
-
-    # output
-    with open(output_path, 'w') as f:
-        for pair in result:
-            f.write(str(pair[0]))
-            f.write('\t')
-            f.write(str(pair[1]))
-            f.write(os.linesep)
-
-    print(f"[Standalone] 完成，结果写入 {output_path}")
 
 
 def _cmd_master(args):
@@ -122,17 +56,9 @@ def _cmd_client(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MapReduce 框架 - 支持单机版和分布式版"
+        description="MapReduce 分布式框架"
     )
     subparsers = parser.add_subparsers(dest="mode", help="运行模式")
-
-    # ---- standalone ----
-    p_standalone = subparsers.add_parser("standalone", help="单机版 MapReduce")
-    p_standalone.add_argument("input", help="输入文件路径")
-    p_standalone.add_argument("output", help="输出文件路径")
-    p_standalone.add_argument("mapper_pkl", help="mapper pickle 文件路径")
-    p_standalone.add_argument("reducer_pkl", help="reducer pickle 文件路径")
-    p_standalone.set_defaults(func=_cmd_standalone)
 
     # ---- master ----
     p_master = subparsers.add_parser("master", help="启动 Master 节点 (JobTracker)")

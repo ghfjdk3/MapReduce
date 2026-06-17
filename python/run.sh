@@ -60,7 +60,7 @@ echo ""
 echo "[等待] Worker 注册到 Master..."
 sleep 3
 
-# ---- 3. 提交作业 ----
+# ---- 3. 启动 Client 提交作业并等待完成 ----
 echo ""
 echo "[提交] WordCount 作业..."
 python main.py client \
