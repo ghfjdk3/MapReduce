@@ -13,6 +13,7 @@ MASTER_JOB_STATUS = "/job_status"
 WORKER_EXECUTE_MAP = "/execute_map"
 WORKER_EXECUTE_REDUCE = "/execute_reduce"
 WORKER_GET_PARTITION = "/partition"
+WORKER_NOTIFY_MAP_READY = "/notify_map_ready"
 WORKER_PING = "/ping"
 
 # JSON 字段名
@@ -29,10 +30,13 @@ FIELD_REDUCE_RESULT = "reduce_result"
 FIELD_PARTITION_ID = "partition_id"
 FIELD_MAP_WORKERS = "map_workers"
 FIELD_NUM_REDUCERS = "num_reducers"
+FIELD_TOTAL_MAP_TASKS = "total_map_tasks"
 FIELD_PARTITION_DATA = "partition_data"
 FIELD_STATUS = "status"
 FIELD_ERROR = "error"
 FIELD_WORKER_ID = "worker_id"
+FIELD_SLOT_TYPE = "slot_type"
+FIELD_MAP_WORKER_INFO = "map_worker_info"
 
 # 作业状态
 STATUS_PENDING = "pending"
@@ -45,6 +49,14 @@ STATUS_FAILED = "failed"
 # 默认配置
 DEFAULT_MASTER_PORT = 5000
 DEFAULT_WORKER_PORT = 5001
+MAP_REDUCE_PORT_OFFSET = 1000
 DEFAULT_TIMEOUT = 30
 OUTPUT_DELIMITER = "\t"
 OUTPUT_LINE_END = os.linesep
+
+# Slot 类型
+SLOT_TYPE_MAP = "map"
+SLOT_TYPE_REDUCE = "reduce"
+
+# Reduce 提前触发阈值
+MAP_PROGRESS_TRIGGER_RATIO = 0.1

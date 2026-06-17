@@ -21,7 +21,7 @@ echo "=========================================="
 echo " MapReduce 分布式 WordCount 运行脚本"
 echo "=========================================="
 echo ""
-echo "架构: 1 Master + ${WORKER_COUNT} Workers"
+echo "架构: 1 Master + ${WORKER_COUNT} Workers (每个双 Slot: Map + Reduce)"
 echo ""
 
 # 清理旧的临时文件
